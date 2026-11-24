@@ -8,12 +8,29 @@ public struct AgentActivityMetrics: Sendable {
     public let toolCalls: Int?
     public let toolCountIsPartial: Bool
     public let toolIsRunning: Bool
+    public let activeToolKind: TranscriptItem.ToolCall.ActivityKind?
+    public let latestWebSearchCallID: String?
+    public let webSearchIsRunning: Bool
+    public let turnStartedAt: Double?
   }
 
   private struct Call: Sendable {
     let id: String
-    let running: Bool
+    var running: Bool
     let standalone: Bool
+    var kind: TranscriptItem.ToolCall.ActivityKind
+    var isWebSearch: Bool
+
+    init(_ json: JSONValue, fallbackID: String, standalone: Bool) {
+      id = json["callId"]?.stringValue ?? fallbackID
+      running = json["state"]?.stringValue == "running"
+      self.standalone = standalone
+      let name = json["name"]?.stringValue ?? ""
+      let command = json["input"]?["command"]?.stringValue
+      let hasWebResults = json["webSearchResults"].map { $0 != .null } ?? false
+      kind = TranscriptItem.ToolCall.activityKind(name: name, command: command, hasWebSearchResults: hasWebResults)
+      isWebSearch = kind == .webSearch
+    }
   }
 
   private struct TokenCount: Sendable {
@@ -38,6 +55,7 @@ public struct AgentActivityMetrics: Sendable {
     let agentId: String?
     let turnId: String?
     let turnRunning: Bool?
+    let turnStartedAt: Double?
     let calls: [Call]
     let results: [String]
     let subagentUsage: [TokenCount]
@@ -54,14 +72,18 @@ public struct AgentActivityMetrics: Sendable {
       let kind = body["kind"]?.stringValue
       let blocks = body["blocks"]?.arrayValue ?? []
       turnRunning = kind == "turn" ? body["state"]?.stringValue.map { $0 == "running" } : nil
+      if kind == "turn" {
+        let candidate = body["startedAt"]?.doubleValue ?? item["observedAt"]?.doubleValue
+        turnStartedAt = candidate.flatMap { $0 > 0 ? $0 : nil }
+      } else {
+        turnStartedAt = nil
+      }
       if kind == "tool-call" {
-        calls = [Call(id: body["callId"]?.stringValue ?? "row:\(id)",
-          running: body["state"]?.stringValue == "running", standalone: true)]
+        calls = [Call(body, fallbackID: "row:\(id)", standalone: true)]
       } else {
         calls = blocks.enumerated().compactMap { index, block in
           guard block["type"]?.stringValue == "tool-call" else { return nil }
-          return Call(id: block["callId"]?.stringValue ?? "row:\(id):\(index)",
-            running: block["state"]?.stringValue == "running", standalone: false)
+          return Call(block, fallbackID: "row:\(id):\(index)", standalone: false)
         }
       }
       results = blocks.compactMap { $0["type"]?.stringValue == "tool-result" ? $0["callId"]?.stringValue : nil }
@@ -78,6 +100,7 @@ public struct AgentActivityMetrics: Sendable {
   private struct Turn: Sendable {
     let id: String
     let running: Bool
+    let startedAt: Double?
   }
 
   private var cursor: TranscriptCursor?
@@ -148,14 +171,21 @@ public struct AgentActivityMetrics: Sendable {
 
   private mutating func noteTurn(_ marker: JSONValue?) {
     let previous = turn?.id
+    let previousStartedAt = turn?.startedAt
     if let marker {
       turn = marker["itemId"]?.stringValue.map { id in
-        Turn(id: id, running: marker["turn"]?["state"]?.stringValue == "running")
+        let markerStart = marker["turn"]?["startedAt"]?.doubleValue.flatMap { $0 > 0 ? $0 : nil }
+        let rowStart = rows[id]?.turnStartedAt
+        let keptStart = previous == id ? previousStartedAt : nil
+        return Turn(id: id, running: marker["turn"]?["state"]?.stringValue == "running",
+          startedAt: markerStart ?? rowStart ?? keptStart)
       }
     } else if let latest = rows.values.filter({ $0.agentId == nil && $0.turnRunning != nil })
       .max(by: { $0.sequence < $1.sequence }) {
       if turn.flatMap({ rows[$0.id] != nil }) != false {
-        turn = Turn(id: latest.id, running: latest.turnRunning == true)
+        let keptStart = previous == latest.id ? previousStartedAt : nil
+        turn = Turn(id: latest.id, running: latest.turnRunning == true,
+          startedAt: latest.turnStartedAt ?? keptStart)
       }
     }
     if let id = turn?.id, previous != id {
@@ -165,7 +195,9 @@ public struct AgentActivityMetrics: Sendable {
 
   public func reading(agentId: String?, includeChildTokenFloor: Bool = false) -> Reading {
     guard cursor != nil, !catchingUp else {
-      return Reading(totalTokens: nil, tokenCountIsPartial: false, toolCalls: nil, toolCountIsPartial: false, toolIsRunning: false)
+      return Reading(
+        totalTokens: nil, tokenCountIsPartial: false, toolCalls: nil, toolCountIsPartial: false, toolIsRunning: false,
+        activeToolKind: nil, latestWebSearchCallID: nil, webSearchIsRunning: false, turnStartedAt: nil)
     }
     let turnId = turn?.id
     let agentRows = rows.values.filter { $0.agentId == agentId }
@@ -173,6 +205,17 @@ public struct AgentActivityMetrics: Sendable {
     let calls = resolvedCalls(in: relevant)
     let running = (turn?.running == true || agentId != nil) && calls.values.contains(where: \.running)
     let canCount = turnId != nil && (agentId == nil ? turn?.running == true : !relevant.isEmpty)
+    let activeToolKind: TranscriptItem.ToolCall.ActivityKind? = canCount && running
+      ? relevant.filter { $0.calls.contains { calls[$0.id]?.running == true } }
+        .max { $0.sequence < $1.sequence }?
+        .calls.last { calls[$0.id]?.running == true }
+        .flatMap { calls[$0.id]?.kind }
+      : nil
+    let webSearches = calls.filter { $0.value.isWebSearch }
+    let latestSearch = canCount && !webSearches.isEmpty
+      ? relevant.filter { $0.calls.contains { webSearches[$0.id] != nil } }.max { $0.sequence < $1.sequence }?
+        .calls.last { webSearches[$0.id] != nil }
+      : nil
     let start = turnId.flatMap { rows[$0]?.sequence }
     let unscoped = agentRows.contains { row in
       row.turnId == nil && !row.calls.isEmpty && row.sequence >= (start ?? 0)
@@ -187,17 +230,36 @@ public struct AgentActivityMetrics: Sendable {
       tokenCountIsPartial: floor != nil,
       toolCalls: canCount && (!partial || !calls.isEmpty) ? calls.count : nil,
       toolCountIsPartial: partial,
-      toolIsRunning: running)
+      toolIsRunning: running,
+      activeToolKind: activeToolKind,
+      latestWebSearchCallID: latestSearch?.id,
+      webSearchIsRunning: running && webSearches.values.contains(where: \.running),
+      turnStartedAt: canCount ? (turn?.startedAt ?? turnId.flatMap { rows[$0]?.turnStartedAt }) : nil)
   }
 
   private func resolvedCalls(in rows: [Row]) -> [String: Call] {
     let results = Set(rows.flatMap(\.results))
     var calls: [String: Call] = [:]
-    for call in rows.flatMap(\.calls) {
-      if let old = calls[call.id], (old.standalone && !call.standalone || old.standalone == call.standalone && !old.running) {
+    for var call in rows.flatMap(\.calls) {
+      let old = calls[call.id]
+      if let old, (old.standalone && !call.standalone || old.standalone == call.standalone && !old.running) {
+        if call.isWebSearch {
+          calls[call.id]?.isWebSearch = true
+          calls[call.id]?.kind = .webSearch
+        } else if old.kind == .other && call.kind != .other {
+          calls[call.id]?.kind = call.kind
+        }
         continue
       }
-      calls[call.id] = Call(id: call.id, running: call.running && !results.contains(call.id), standalone: call.standalone)
+      call.running = call.running && !results.contains(call.id)
+      let mergedWebSearch = call.isWebSearch || old?.isWebSearch == true
+      call.isWebSearch = mergedWebSearch
+      if mergedWebSearch {
+        call.kind = .webSearch
+      } else if call.kind == .other, let oldKind = old?.kind, oldKind != .other {
+        call.kind = oldKind
+      }
+      calls[call.id] = call
     }
     return calls
   }

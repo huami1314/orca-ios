@@ -17,13 +17,13 @@ enum ToolCategory: CaseIterable {
     if ["bash", "shell", "exec", "local_shell", "exec_command", "run_command", "command"].contains(word) {
       return (call.input["command"]?.stringValue ?? "").contains("orca browser") ? .browser : .command
     }
+    if TranscriptItem.ToolCall.isWebSearch(name: word) { return .webSearch }
     switch word {
     case "read", "read_file", "view": return .read
     case "search", "grep", "glob": return .search
     case "list", "ls": return .listFiles
     case "diff", "edit", "multiedit", "write", "notebookedit", "apply_patch", "str_replace_based_edit_tool": return .fileChange
     case "task", "agent", "subagent": return .subagent
-    case "webfetch", "web search", "websearch", "web_search": return .webSearch
     case "todowrite", "update_plan": return .plan
     default: return .other
     }

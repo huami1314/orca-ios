@@ -45,14 +45,39 @@ enum AgentMark {
     return .transparent
   }
 
+  private struct OverlayCacheKey: Hashable {
+    let type: String?
+    let sizeTenths: Int
+  }
+
+  private static let overlayCacheLock = NSLock()
+  private nonisolated(unsafe) static var overlayCache: [OverlayCacheKey: UIImage] = [:]
+
   /// The overlay is always dark, even when the phone is in light appearance.
   static func overlayImage(for type: String?, size: CGFloat) -> UIImage {
-    if let mark = icon(for: type) {
-      let image = mark.image(size: size)
-      return mark.color == nil ? image.withTintColor(.white, renderingMode: .alwaysOriginal) : image
+    let key = OverlayCacheKey(type: type, sizeTenths: Int((size * 10).rounded()))
+    overlayCacheLock.lock()
+    if let cached = overlayCache[key] {
+      overlayCacheLock.unlock()
+      return cached
     }
-    if let type, let image = UIImage(named: "AgentLogos/\(type)") { return image }
-    return Lucide.bot.image(size: size).withTintColor(.white, renderingMode: .alwaysOriginal)
+    overlayCacheLock.unlock()
+
+    let image: UIImage
+    if let mark = icon(for: type) {
+      let rendered = mark.image(size: size, scale: 3)
+      image = mark.color == nil ? rendered.withTintColor(.white, renderingMode: .alwaysOriginal) : rendered
+    } else if let type, let asset = UIImage(named: "AgentLogos/\(type)") {
+      image = asset
+    } else {
+      image = Lucide.bot.image(size: size).withTintColor(.white, renderingMode: .alwaysOriginal)
+    }
+
+    overlayCacheLock.lock()
+    if overlayCache.count >= 128 { overlayCache.removeAll(keepingCapacity: true) }
+    overlayCache[key] = image
+    overlayCacheLock.unlock()
+    return image
   }
 }
 
@@ -61,18 +86,24 @@ struct FilledIcon {
   /// Nil draws in the primary text colour.
   let color: UIColor?
   let evenOdd: Bool
+  let path: CGPath
 
-  var path: CGPath {
-    let path = CGMutablePath()
-    SVGPathParser.append(d, to: path)
-    return path
+  init(d: String, color: UIColor?, evenOdd: Bool) {
+    self.d = d
+    self.color = color
+    self.evenOdd = evenOdd
+    let parsed = CGMutablePath()
+    SVGPathParser.append(d, to: parsed)
+    self.path = parsed.copy() ?? parsed
   }
 
   /// The mark as an image, for menus. A coloured mark keeps its colour; a plain one follows the tint.
-  func image(size: CGFloat) -> UIImage {
-    let image = UIGraphicsImageRenderer(size: CGSize(width: size, height: size)).image { context in
-      let scale = size / 24
-      context.cgContext.scaleBy(x: scale, y: scale)
+  func image(size: CGFloat, scale: CGFloat? = nil) -> UIImage {
+    let format = UIGraphicsImageRendererFormat()
+    if let scale { format.scale = scale }
+    let image = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format).image { context in
+      let factor = size / 24
+      context.cgContext.scaleBy(x: factor, y: factor)
       context.cgContext.addPath(path)
       context.cgContext.setFillColor((color ?? .black).cgColor)
       context.cgContext.fillPath(using: evenOdd ? .evenOdd : .winding)

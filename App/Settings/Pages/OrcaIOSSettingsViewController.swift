@@ -52,14 +52,14 @@ final class OrcaIOSSettingsViewController: SettingsPageViewController {
         header: String(localized: "orcaios.settings.pipHeading", defaultValue: "PICTURE IN PICTURE"),
         footer: String(
           localized: "orcaios.settings.pipFooter",
-          defaultValue: "Two-line mode cycles through working agents on your paired desktops. The session's ⋯ menu opens Picture in Picture at any time."),
+          defaultValue: "Never lose track of your agents while scrolling TikTok."),
         rows: [
           .toggle(
             title: String(localized: "orcaios.pip.onLeave", defaultValue: "Picture in Picture on leaving"),
             isOn: PiPCenter.startsOnLeave
           ) { on in PiPCenter.startsOnLeave = on },
           .toggle(
-            title: String(localized: "orcaios.pip.compact", defaultValue: "Two-line mode"),
+            title: String(localized: "orcaios.pip.compact", defaultValue: "Mini status bar"),
             isOn: PiPCenter.usesCompactLayout
           ) { [weak self] on in
             PiPCenter.usesCompactLayout = on

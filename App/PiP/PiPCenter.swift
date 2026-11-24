@@ -20,14 +20,23 @@ struct PiPFrame: Equatable {
     var tokenCountIsPartial = false
     var toolCount: String?
     var toolRunning = false
+    var activeToolKind: TranscriptItem.ToolCall.ActivityKind?
+    var webSearchStartedAt: TimeInterval?
+    var elapsedText: String?
+
+    var showsChildStackSpinner: Bool { activity == .working && !leadWorking && !childTypes.isEmpty }
+    var showsWorkingSpinner: Bool { activity == .working && (leadWorking || !childTypes.isEmpty) }
   }
   struct ScrollState: Equatable {
     let activities: [WorkingAgent.Activity]
     let activeIndices: [Int]
     let pinsFirstRow: Bool
+    let splitAt: Int?
+    let isPaused: Bool
   }
   struct StatusRow: Equatable {
     let id: WorkingAgent.ID
+    let worktreeId: String
     let line: StatusLine
   }
 
@@ -46,6 +55,26 @@ struct PiPFrame: Equatable {
       && a.terminal == b.terminal && a.statusRows == b.statusRows && a.scrollState == b.scrollState
       && a.statusAvailable == b.statusAvailable
       && a.lines.elementsEqual(b.lines) { $0.text == $1.text && $0.style == $1.style }
+  }
+}
+
+struct PiPScrollTransition: Equatable {
+  enum Kind: Equatable {
+    case full(leaving: PiPFrame.StatusLine)
+    case perRow(leavingFirst: PiPFrame.StatusLine?, leavingSecond: PiPFrame.StatusLine?)
+    /// 1 -> 2: single expanded hero contracts smoothly into its target compact row while the second enters.
+    case expandToTwo(wasRowIndex: Int)
+    /// 2 -> 1: the departing compact row fades away while the surviving row expands into the 60pt hero card.
+    case collapseToOne(departing: PiPFrame.StatusLine, departingRowIndex: Int)
+  }
+  let kind: Kind
+  let fromScroll: PiPFrame.ScrollState?
+  let direction: Int
+
+  init(kind: Kind, fromScroll: PiPFrame.ScrollState?, direction: Int = 1) {
+    self.kind = kind
+    self.fromScroll = fromScroll
+    self.direction = direction
   }
 }
 
@@ -115,18 +144,26 @@ final class PiPCenter: NSObject {
   private var workStatus: PiPWorkStatus?
   private var rotation = WorkingAgentRotation()
   private var waitingAgents: Set<WorkingAgent.ID> = []
+  private var activitySince: [WorkingAgent.ID: (activity: WorkingAgent.Activity, uptime: TimeInterval)] = [:]
+  private var lastPresentedAttention: (host: UUID, worktreeId: String)?
+  private var lastPresentedRow: (host: UUID, worktreeId: String)?
   private let telemetry = PiPAgentTelemetry()
   private var controller: AVPictureInPictureController?
   private var timer: Timer?
+  private var animationTimer: Timer?
   private var last: PiPFrame?
   private var lastLayout: PiPLayout?
   private var transition: Task<Void, Never>?
   private var lastDrawn = Date.distantPast
   private let silence = SilentAudio()
   private(set) var isActive = false
+  private var rotationPaused = false
+  private var pendingStep = 0
   /// The system starts picture in picture on leaving only from media that plays; idle, the frames read as
   /// paused, so nothing opens. Read from the playback delegate, off the main actor.
   nonisolated(unsafe) private static var playing = false
+  /// True when the mini status bar has >2 active groups so PiP skip buttons can step backward/forward.
+  nonisolated(unsafe) private static var skippable = false
   /// The window was opened from the session menu: it stays even while idle.
   private var openedByHand = false
 
@@ -153,6 +190,12 @@ final class PiPCenter: NSObject {
   /// The source layer must be in the live window for iOS to offer picture in picture.
   private func refreshAttachment() {
     dumpForDebugging()
+    if telemetry.onUpdate == nil {
+      telemetry.onUpdate = { [weak self] in
+        guard let self, self.isActive, Self.usesCompactLayout else { return }
+        self.draw(force: false)
+      }
+    }
     if !Self.usesCompactLayout || compactHost == nil { telemetry.follow([], model: AppModel.shared) }
     guard isSupported else { return }
     guard let view = Self.usesCompactLayout ? compactHost : sessionHost else {
@@ -160,6 +203,7 @@ final class PiPCenter: NSObject {
       cancelTransition()
       timer?.invalidate()
       timer = nil
+      setAnimatingFrames(false)
       last = nil
       lastLayout = nil
       updateAutoStart()
@@ -184,10 +228,11 @@ final class PiPCenter: NSObject {
     draw(force: true)
   }
 
-  private func frame() -> (content: PiPFrame, didAdvance: Bool, scrollsOnlySecondRow: Bool)? {
+  private func frame() -> (content: PiPFrame, didAdvance: Bool, stepDirection: Int, scrollsOnlySecondRow: Bool, isSplit: Bool)? {
     guard Self.usesCompactLayout else {
+      pendingStep = 0
       guard let transcript = transcriptFrame?() else { return nil }
-      return (transcript, false, false)
+      return (transcript, false, 0, false, false)
     }
     let status: PiPWorkStatus
     if let workStatus {
@@ -204,23 +249,48 @@ final class PiPCenter: NSObject {
       workStatus = status
     }
     let time = ProcessInfo.processInfo.systemUptime
+    let nowEpoch = Date().timeIntervalSince1970
+    let activeIDs = Set(status.entries.map(\.id))
+    activitySince = activitySince.filter { activeIDs.contains($0.key) }
+    for entry in status.entries where activitySince[entry.id]?.activity != entry.activity {
+      activitySince[entry.id] = (entry.activity, time)
+    }
+    let manualStep = pendingStep
+    pendingStep = 0
     let waiting = status.entries.filter { $0.activity != .working }.map(\.id)
     let newlyWaiting = waiting.first { !waitingAgents.contains($0) }
     waitingAgents = Set(waiting)
     let pinned = waiting.count == 1 && status.entries.count > 2 ? waiting.first : nil
+    let splitAt = waiting.count >= 2 && waiting.count < status.entries.count ? waiting.count : nil
     let page = rotation.page(
-      in: status.entries.map(\.id), at: time, rotating: isActive,
-      preferring: pinned == nil ? newlyWaiting : nil, pinned: pinned)
+      in: status.entries.map(\.id), at: time, rotating: isActive && !rotationPaused,
+      preferring: pinned == nil ? newlyWaiting : nil, pinned: pinned, splitAt: splitAt, step: manualStep)
     let entries = page.indices.map { status.entries[$0] }
     if isActive {
       var targets = Set(entries.compactMap(\.session))
       if let next = page.nextIndex, let key = status.entries[next].session { targets.insert(key) }
+      if let secondaryNext = page.secondaryNextIndex, let key = status.entries[secondaryNext].session { targets.insert(key) }
       telemetry.follow(targets, model: AppModel.shared)
     }
+    let includeSeconds = isActive
     return (
-      status.frame(showing: entries, page: page) { telemetry.reading($0) },
+      status.frame(showing: entries, page: page, paused: rotationPaused, elapsed: { entry, turnStartedAt in
+        let seconds: Int?
+        if entry.activity == .working, let start = PiPWorkStatus.normalizedEpochSeconds(turnStartedAt, relativeTo: nowEpoch) {
+          seconds = max(0, Int(nowEpoch - start))
+        } else if let updated = PiPWorkStatus.normalizedEpochSeconds(entry.agent.updatedAt, relativeTo: nowEpoch) {
+          seconds = max(0, Int(nowEpoch - updated))
+        } else if let since = activitySince[entry.id]?.uptime {
+          seconds = max(0, Int(time - since))
+        } else {
+          seconds = nil
+        }
+        return seconds.flatMap { PiPWorkStatus.formatElapsed($0, includeSeconds: includeSeconds) }
+      }, reading: { telemetry.reading($0, at: time) }),
       page.didAdvance,
-      page.scrollsOnlySecondRow
+      page.stepDirection,
+      page.scrollsOnlySecondRow,
+      page.splitAt != nil
     )
   }
 
@@ -240,15 +310,36 @@ final class PiPCenter: NSObject {
     if controller?.canStartPictureInPictureAutomaticallyFromInline != wanted {
       controller?.canStartPictureInPictureAutomaticallyFromInline = wanted
     }
-    // Playing is what the system auto-starts from: only when leaving should open it, or the window is open
-    // because the person asked.
-    let playing = openedByHand || wanted
-    if Self.playing != playing {
+    // Enable PiP skip buttons only when the mini status bar has extra rows to flip through.
+    let canSkip = Self.usesCompactLayout && ((last?.scrollState?.activities.count ?? 0) > 2)
+    let needsLinear = !canSkip
+    if controller?.requiresLinearPlayback != needsLinear {
+      controller?.requiresLinearPlayback = needsLinear
+    }
+    let skipChanged = Self.skippable != canSkip
+    Self.skippable = canSkip
+    // While inactive, playing signals auto-start on leave. While active in mini status bar,
+    // playing reflects whether auto-rotation is running (pause pins the visible pair).
+    let playing = isActive && Self.usesCompactLayout ? !rotationPaused : (openedByHand || wanted)
+    if Self.playing != playing || skipChanged {
       Self.playing = playing
       controller?.invalidatePlaybackState()
     }
-    // Keep an open overlay updating. The app-wide layout can release audio while it has nothing to show.
+    // Keep an open overlay updating (including while rotation is paused).
     if attached && (isActive || playing || !Self.usesCompactLayout) { silence.start() } else { silence.stop() }
+  }
+
+  private func setRotationPaused(_ paused: Bool) {
+    guard isActive, Self.usesCompactLayout, rotationPaused != paused else { return }
+    rotationPaused = paused
+    updateAutoStart()
+    draw(force: true)
+  }
+
+  private func stepRotation(_ delta: Int) {
+    guard isActive, Self.usesCompactLayout, delta != 0 else { return }
+    pendingStep = delta > 0 ? 1 : -1
+    draw(force: true)
   }
 
   /// The app is about to go: decide from what is on screen right now, not the last frame drawn.
@@ -283,10 +374,31 @@ final class PiPCenter: NSObject {
     }
   }
 
+  /// Redraw the current frame without polling agent telemetry or advancing the rows.
+  private func setAnimatingFrames(_ animating: Bool) {
+    if !animating {
+      animationTimer?.invalidate()
+      animationTimer = nil
+      return
+    }
+    guard animationTimer == nil else { return }
+    let timer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let self, self.transition == nil, let frame = self.last,
+          self.layer.sampleBufferRenderer.isReadyForMoreMediaData
+        else { return }
+        self.enqueue(frame, layout: .compact)
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    animationTimer = timer
+  }
+
   /// Draws a new frame when the content changed, and at least every few seconds so the layer stays live.
   private func draw(force: Bool) {
     guard host.superview != nil else { return }
-    guard let (frame, didAdvance, scrollsOnlySecondRow) = frame() else {
+    guard let (frame, didAdvance, stepDirection, scrollsOnlySecondRow, isSplit) = frame() else {
+      setAnimatingFrames(false)
       if last != nil {
         last = nil
         cancelTransition()
@@ -296,26 +408,76 @@ final class PiPCenter: NSObject {
       return
     }
     let layout = Self.layout
+    if isActive, layout == .compact {
+      if let attention = frame.statusRows.first(where: { $0.line.activity != .working }) {
+        lastPresentedAttention = (attention.id.host, attention.worktreeId)
+      } else {
+        lastPresentedAttention = nil
+      }
+      if let first = frame.statusRows.first {
+        lastPresentedRow = (first.id.host, first.worktreeId)
+      } else {
+        lastPresentedRow = nil
+      }
+    }
+    let animate = isActive && !UIAccessibility.isReduceMotionEnabled && layout == .compact
+    let shouldAnimateFrames = animate && frame.statusRows.contains { row in
+      row.line.showsWorkingSpinner || (row.line.activity == .working && row.line.webSearchStartedAt != nil)
+    }
+    let animationChanged = shouldAnimateFrames != (animationTimer != nil)
     let now = Date()
-    guard force || frame != last || layout != lastLayout || now.timeIntervalSince(lastDrawn) > 4 else { return }
+    guard force || frame != last || layout != lastLayout || animationChanged || now.timeIntervalSince(lastDrawn) > 4 else { return }
     let previous = layout == .compact && lastLayout == .compact ? last?.statusRows : nil
+    let previousScroll = layout == .compact && lastLayout == .compact ? last?.scrollState : nil
     if lastLayout != layout { layer.flushAndRemoveImage() }
     last = frame
     lastLayout = layout
     lastDrawn = now
+    setAnimatingFrames(shouldAnimateFrames)
     updateAutoStart()
-    let animate = isActive && !UIAccessibility.isReduceMotionEnabled && layout == .compact
     // Update telemetry during the animation without interrupting the rows that are already moving.
     if animate, transition != nil, previous?.map(\.id) == frame.statusRows.map(\.id) { return }
     cancelTransition()
-    if animate, didAdvance, let previous, previous.count == 2, frame.statusRows.count == 2 {
-      if scrollsOnlySecondRow, previous[0].id == frame.statusRows[0].id, previous[1].id != frame.statusRows[1].id {
-        scroll(leaving: previous[1].line, onlySecondRow: true)
+    if animate, let previous {
+      if previous.count == 1, frame.statusRows.count == 2,
+        let survivedIndex = frame.statusRows.firstIndex(where: { $0.id == previous[0].id }) {
+        scroll(.init(kind: .expandToTwo(wasRowIndex: survivedIndex), fromScroll: previousScroll), duration: 0.28)
         return
       }
-      if !scrollsOnlySecondRow, previous[1].id == frame.statusRows[0].id {
-        scroll(leaving: previous[0].line, onlySecondRow: false)
+      if previous.count == 2, frame.statusRows.count == 1,
+        let survivedIndex = previous.firstIndex(where: { $0.id == frame.statusRows[0].id }) {
+        let departingIndex = survivedIndex == 0 ? 1 : 0
+        scroll(
+          .init(
+            kind: .collapseToOne(departing: previous[departingIndex].line, departingRowIndex: departingIndex),
+            fromScroll: previousScroll),
+          duration: 0.28)
         return
+      }
+    }
+    if animate, didAdvance, let previous, previous.count == 2, frame.statusRows.count == 2 {
+      let dir = stepDirection < 0 ? -1 : 1
+      if scrollsOnlySecondRow, previous[0].id == frame.statusRows[0].id, previous[1].id != frame.statusRows[1].id {
+        scroll(.init(kind: .perRow(leavingFirst: nil, leavingSecond: previous[1].line), fromScroll: previousScroll, direction: dir))
+        return
+      }
+      if isSplit {
+        let leavingFirst = previous[0].id != frame.statusRows[0].id ? previous[0].line : nil
+        let leavingSecond = previous[1].id != frame.statusRows[1].id ? previous[1].line : nil
+        if leavingFirst != nil || leavingSecond != nil {
+          scroll(.init(kind: .perRow(leavingFirst: leavingFirst, leavingSecond: leavingSecond), fromScroll: previousScroll, direction: dir))
+          return
+        }
+      }
+      if !scrollsOnlySecondRow, !isSplit {
+        if dir > 0, previous[1].id == frame.statusRows[0].id {
+          scroll(.init(kind: .full(leaving: previous[0].line), fromScroll: previousScroll, direction: 1))
+          return
+        }
+        if dir < 0, previous[0].id == frame.statusRows[1].id {
+          scroll(.init(kind: .full(leaving: previous[1].line), fromScroll: previousScroll, direction: -1))
+          return
+        }
       }
     }
     enqueue(frame, layout: layout)
@@ -326,14 +488,13 @@ final class PiPCenter: NSObject {
     transition = nil
   }
 
-  private func scroll(leaving line: PiPFrame.StatusLine, onlySecondRow: Bool) {
+  private func scroll(_ scrollTransition: PiPScrollTransition, duration: TimeInterval = 0.3) {
     transition = Task { [weak self] in
       let start = ProcessInfo.processInfo.systemUptime
-      let duration: TimeInterval = 0.3
       while !Task.isCancelled, let self, let frame = last {
         let elapsed = ProcessInfo.processInfo.systemUptime - start
         let progress = min(CGFloat(elapsed / duration), 1)
-        enqueue(frame, layout: .compact, leaving: line, onlySecondRow: onlySecondRow, progress: progress)
+        enqueue(frame, layout: .compact, transition: scrollTransition, progress: progress)
         if progress == 1 {
           transition = nil
           return
@@ -344,11 +505,19 @@ final class PiPCenter: NSObject {
   }
 
   private func enqueue(
-    _ frame: PiPFrame, layout: PiPLayout, leaving: PiPFrame.StatusLine? = nil,
-    onlySecondRow: Bool = false, progress: CGFloat = 1
+    _ frame: PiPFrame, layout: PiPLayout, transition: PiPScrollTransition? = nil, progress: CGFloat = 1
   ) {
+    let time = ProcessInfo.processInfo.systemUptime
+    let animateSpinners = isActive && layout == .compact && !UIAccessibility.isReduceMotionEnabled
+    let spinnerAngle: CGFloat = animateSpinners
+      ? CGFloat(time.truncatingRemainder(dividingBy: 0.9) / 0.9) * 2 * .pi
+      : 0
+    let childSpinnerAngle: CGFloat = animateSpinners
+      ? CGFloat(time.truncatingRemainder(dividingBy: 1.25) / 1.25) * 2 * .pi
+      : 0
     guard let buffer = PiPRenderer.sampleBuffer(
-      for: frame, layout: layout, leaving: leaving, onlySecondRow: onlySecondRow, progress: progress)
+      for: frame, layout: layout, transition: transition, progress: progress,
+      spinnerAngle: spinnerAngle, childSpinnerAngle: childSpinnerAngle, at: time)
     else { return }
     if layer.status == .failed { layer.flush() }
     layer.enqueue(buffer)
@@ -362,16 +531,26 @@ extension PiPCenter: AVPictureInPictureControllerDelegate {
       updateAutoStart()
       startTimer(interval: 0.5)
       // Opened on its own when it shouldn't have (the setting is off, or nothing runs): close it again.
-      if !openedByHand, !Self.startsOnLeave || !(last?.working ?? false) { controller.stopPictureInPicture() }
+      if !openedByHand, !Self.startsOnLeave || !(last?.working ?? false) {
+        controller.stopPictureInPicture()
+      } else {
+        draw(force: true)
+      }
     }
   }
 
   nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
     MainActor.assumeIsolated {
       isActive = false
+      rotationPaused = false
+      pendingStep = 0
       telemetry.follow([], model: AppModel.shared)
       cancelTransition()
+      setAnimatingFrames(false)
       openedByHand = false
+      lastPresentedAttention = nil
+      lastPresentedRow = nil
+      PiPRenderer.clearCache()
       updateAutoStart()
       if host.superview != nil { startTimer(interval: 1) }
     }
@@ -390,16 +569,36 @@ extension PiPCenter: AVPictureInPictureControllerDelegate {
     _ controller: AVPictureInPictureController,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completion: @escaping (Bool) -> Void
   ) {
-    completion(true)
+    MainActor.assumeIsolated {
+      if Self.usesCompactLayout, let target = lastPresentedAttention ?? lastPresentedRow {
+        var components = URLComponents()
+        components.scheme = "orca"
+        components.host = "open"
+        components.queryItems = [
+          URLQueryItem(name: "host", value: target.host.uuidString),
+          URLQueryItem(name: "worktree", value: target.worktreeId),
+        ]
+        if let url = components.url {
+          NotificationCenter.default.post(name: .orcaOpenURL, object: url)
+        }
+      }
+      completion(true)
+    }
   }
 }
 
 extension PiPCenter: AVPictureInPictureSampleBufferPlaybackDelegate {
-  nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {}
+  nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {
+    Task { @MainActor in
+      self.setRotationPaused(!playing)
+    }
+  }
 
-  /// Live: no start, no end, nothing to scrub.
+  /// Unbounded when >2 active groups can be stepped manually in both directions; otherwise standard live range.
   nonisolated func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
-    CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+    Self.skippable
+      ? CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+      : CMTimeRange(start: .zero, duration: .positiveInfinity)
   }
 
   nonisolated func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {
@@ -413,7 +612,13 @@ extension PiPCenter: AVPictureInPictureSampleBufferPlaybackDelegate {
   nonisolated func pictureInPictureController(
     _ controller: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion: @escaping () -> Void
   ) {
-    completion()
+    let seconds = CMTimeGetSeconds(skipInterval)
+    Task { @MainActor in
+      if Self.usesCompactLayout, self.isActive, seconds.isFinite, seconds != 0 {
+        self.stepRotation(seconds > 0 ? 1 : -1)
+      }
+      completion()
+    }
   }
 }
 

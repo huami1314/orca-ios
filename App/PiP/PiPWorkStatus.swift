@@ -54,14 +54,18 @@ struct PiPWorkStatus {
       }
       return labeled
     }
-    self.entries = labeled.filter { $0.activity != .working } + labeled.filter { $0.activity == .working }
+    self.entries =
+      labeled.filter { $0.activity == .needsDecision }
+      + labeled.filter { $0.activity == .needsAnswer }
+      + labeled.filter { $0.activity == .working }
     self.hostCount = hostCount
     allHostsObserved = observed > 0 && observed == model.hosts.count
   }
 
   func frame(
-    showing visible: [Entry], page: WorkingAgentRotation.Page,
-    reading: (Entry) -> AgentActivityMetrics.Reading?
+    showing visible: [Entry], page: WorkingAgentRotation.Page, paused: Bool = false,
+    elapsed: (Entry, Double?) -> String?,
+    reading: (Entry) -> (metrics: AgentActivityMetrics.Reading, webSearchStartedAt: TimeInterval?)?
   ) -> PiPFrame {
     let title: String
     let status: String
@@ -80,7 +84,9 @@ struct PiPWorkStatus {
       ? .init(
         activities: entries.map(\.activity),
         activeIndices: page.indices,
-        pinsFirstRow: page.scrollsOnlySecondRow)
+        pinsFirstRow: page.scrollsOnlySecondRow,
+        splitAt: page.splitAt,
+        isPaused: paused)
       : nil
     return PiPFrame(
       title: title, status: status, working: !entries.isEmpty, lines: [], terminal: false,
@@ -89,14 +95,44 @@ struct PiPWorkStatus {
         line.activity = entry.activity
         line.leadWorking = entry.agent.leadActivity == .working
         line.childTypes = entry.workingChildTypes
-        if let value = reading(entry) {
+        var turnStartedAt: Double?
+        if let (value, webSearchStartedAt) = reading(entry) {
           line.totalTokens = value.totalTokens
           line.tokenCountIsPartial = value.tokenCountIsPartial
           line.toolCount = value.toolCalls.map { (value.toolCountIsPartial ? "≥" : "") + String($0) }
           line.toolRunning = value.toolIsRunning
+          line.activeToolKind = value.activeToolKind
+          line.webSearchStartedAt = webSearchStartedAt
+          turnStartedAt = value.turnStartedAt
         }
-        return .init(id: entry.id, line: line)
+        let needsElapsed = line.activity != .working
+          ? line.totalTokens == nil
+          : (line.totalTokens == nil && line.toolCount == nil)
+        if needsElapsed {
+          line.elapsedText = elapsed(entry, turnStartedAt)
+        }
+        return .init(id: entry.id, worktreeId: entry.agent.worktreeId, line: line)
       }, scrollState: scrollState, statusAvailable: allHostsObserved)
+  }
+
+  static func formatElapsed(_ seconds: Int, includeSeconds: Bool) -> String? {
+    guard seconds >= 1 else { return nil }
+    if seconds < 60 {
+      return includeSeconds ? "\(seconds)s" : nil
+    }
+    let minutes = seconds / 60
+    if minutes < 60 { return "\(minutes)m" }
+    return "\(minutes / 60)h"
+  }
+
+  static func normalizedEpochSeconds(_ raw: Double?, relativeTo now: TimeInterval) -> TimeInterval? {
+    guard let raw, raw.isFinite, raw > 0 else { return nil }
+    let seconds = raw > 1_000_000_000_000 ? raw / 1000 : raw
+    // Reject implausible timestamps (before 2020 or >7 days stale / >5s in future).
+    guard seconds > 1_577_836_800 else { return nil }
+    let age = now - seconds
+    guard age >= -5, age < 86_400 * 7 else { return nil }
+    return seconds
   }
 
   private static func title(_ agent: WorkingAgent) -> String {
@@ -106,6 +142,49 @@ struct PiPWorkStatus {
 
   private static func oneLine(_ value: String) -> String {
     value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+  }
+}
+
+struct PiPWebSearchIndicator {
+  private static let displayDuration: TimeInterval = 2
+  private static let cycleDuration: TimeInterval = 3
+  private static let transitionDuration: TimeInterval = 0.25
+
+  private var latestCallID: String?
+  private var startedAt: TimeInterval?
+  private var pending = false
+
+  /// Record searches already present in a journal snapshot without replaying them.
+  mutating func seed(latestCallID: String?) {
+    self.latestCallID = latestCallID
+    pending = false
+  }
+
+  mutating func pulseStart(for reading: AgentActivityMetrics.Reading, at time: TimeInterval) -> TimeInterval? {
+    guard reading.toolCalls != nil else { return nil }
+    let elapsed = startedAt.map { time - $0 } ?? .infinity
+    if let callID = reading.latestWebSearchCallID {
+      if callID != latestCallID, elapsed >= Self.displayDuration { pending = true }
+    } else {
+      pending = false
+    }
+    latestCallID = reading.latestWebSearchCallID
+    if elapsed >= Self.cycleDuration, pending || reading.webSearchIsRunning {
+      startedAt = time
+      pending = false
+      return time
+    }
+    return elapsed < Self.displayDuration ? startedAt : nil
+  }
+
+  static func globeOpacity(startedAt: TimeInterval?, at time: TimeInterval, animated: Bool) -> CGFloat {
+    guard let startedAt else { return 0 }
+    let elapsed = time - startedAt
+    guard elapsed >= 0, elapsed < displayDuration else { return 0 }
+    guard animated else { return 1 }
+    let edge = min(elapsed, displayDuration - elapsed)
+    let progress = CGFloat(min(edge / transitionDuration, 1))
+    return progress * progress * (3 - 2 * progress)
   }
 }
 
@@ -120,12 +199,52 @@ final class PiPAgentTelemetry {
   private final class Stream {
     let connection: OrcaConnection
     var metrics = AgentActivityMetrics()
+    var webSearch = PiPWebSearchIndicator()
     var task: Task<Void, Never>?
+    private var catchingUp = false
+    private var hadSnapshot = false
 
     init(connection: OrcaConnection) { self.connection = connection }
+
+    func apply(_ frame: JSONValue) -> Bool {
+      let before = metrics.reading(agentId: nil, includeChildTokenFloor: true)
+      metrics.apply(frame)
+      var shouldNotify = false
+      switch frame["type"]?.stringValue {
+      case "snapshot", "reset":
+        catchingUp = frame["page"]?["hasNewer"]?.boolValue == true
+        seedWebSearch()
+        if !catchingUp && !hadSnapshot {
+          hadSnapshot = true
+          shouldNotify = true
+        }
+      case "batch":
+        let wasCatchingUp = catchingUp
+        catchingUp = frame["hasNewer"]?.boolValue == true
+        if wasCatchingUp, !catchingUp {
+          seedWebSearch()
+          hadSnapshot = true
+          shouldNotify = true
+        }
+      default:
+        break
+      }
+      if !shouldNotify, !catchingUp {
+        let after = metrics.reading(agentId: nil, includeChildTokenFloor: true)
+        if before.toolIsRunning != after.toolIsRunning || before.activeToolKind != after.activeToolKind {
+          shouldNotify = true
+        }
+      }
+      return shouldNotify
+    }
+
+    private func seedWebSearch() {
+      webSearch.seed(latestCallID: metrics.reading(agentId: nil).latestWebSearchCallID)
+    }
   }
 
   private var streams: [Key: Stream] = [:]
+  var onUpdate: (() -> Void)?
 
   func follow(_ targets: Set<Key>, model: AppModel) {
     for key in Array(streams.keys) where !targets.contains(key) || model.session(for: key.host)?.api.connection !== streams[key]?.connection {
@@ -135,7 +254,7 @@ final class PiPAgentTelemetry {
       guard let api = model.session(for: key.host)?.api else { continue }
       let stream = Stream(connection: api.connection)
       streams[key] = stream
-      stream.task = Task { [weak stream] in
+      stream.task = Task { [weak self, weak stream] in
         var delay = Duration.seconds(1)
         while !Task.isCancelled {
           let subscription = await api.chat(sessionId: key.sessionId, resumingFrom: nil)
@@ -143,7 +262,9 @@ final class PiPAgentTelemetry {
           do {
             for try await frame in subscription.events {
               guard !Task.isCancelled else { break }
-              stream?.metrics.apply(frame)
+              if stream?.apply(frame) == true {
+                self?.onUpdate?()
+              }
               if frame["type"]?.stringValue == "end" { break }
               delay = .seconds(1)
             }
@@ -161,7 +282,12 @@ final class PiPAgentTelemetry {
     }
   }
 
-  func reading(_ entry: PiPWorkStatus.Entry) -> AgentActivityMetrics.Reading? {
-    entry.session.flatMap { streams[$0]?.metrics.reading(agentId: nil, includeChildTokenFloor: true) }
+  func reading(
+    _ entry: PiPWorkStatus.Entry, at time: TimeInterval
+  ) -> (metrics: AgentActivityMetrics.Reading, webSearchStartedAt: TimeInterval?)? {
+    guard let key = entry.session, let stream = streams[key] else { return nil }
+    let metrics = stream.metrics.reading(agentId: nil, includeChildTokenFloor: true)
+    let webSearchStartedAt = stream.webSearch.pulseStart(for: metrics, at: time)
+    return (metrics, webSearchStartedAt)
   }
 }

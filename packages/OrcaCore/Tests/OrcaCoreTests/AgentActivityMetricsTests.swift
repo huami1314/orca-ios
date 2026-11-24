@@ -30,6 +30,74 @@ import Testing
     #expect(metrics.reading(agentId: "child").toolCalls == nil)
   }
 
+  @Test func identifiesWebSearchAcrossRepresentationsAndSettlesWithTheResult() {
+    var metrics = AgentActivityMetrics()
+    metrics.apply(snapshot(sequence: 5, rows: [
+      row("turn", sequence: 1, body: ["kind": "turn", "state": "running"], scope: nil),
+      row("search-call", sequence: 2, body: tool("search", state: "running")),
+      row("inline", sequence: 3, body: ["kind": "message", "blocks": [
+        ["type": "tool-call", "callId": "search", "name": "WebSearch"],
+      ]]),
+      row("file-search", sequence: 4, body: ["kind": "tool-call", "name": "grep", "state": "running"]),
+      row("child-search", sequence: 5, agent: "child",
+        body: ["kind": "tool-call", "callId": "child-search", "name": "search_web", "state": "running"]),
+    ]))
+    let live = metrics.reading(agentId: nil)
+    #expect(live.toolCalls == 2)
+    #expect(live.latestWebSearchCallID == "search")
+    #expect(live.webSearchIsRunning)
+    #expect(metrics.reading(agentId: "child").latestWebSearchCallID == "child-search")
+
+    metrics.apply(batch(sequence: 6, rows: [row("result", sequence: 6, body: ["kind": "message", "blocks": [
+      ["type": "tool-result", "callId": "search"],
+    ]])]))
+    let settled = metrics.reading(agentId: nil)
+    #expect(settled.latestWebSearchCallID == "search")
+    #expect(!settled.webSearchIsRunning)
+    #expect(settled.toolIsRunning)
+
+    metrics.apply(batch(sequence: 7, rows: [row("fast-search", sequence: 7, body: [
+      "kind": "tool-call", "callId": "fast", "state": "completed", "webSearchResults": [],
+    ])]))
+    #expect(metrics.reading(agentId: nil).latestWebSearchCallID == "fast")
+    #expect(!metrics.reading(agentId: nil).webSearchIsRunning)
+    metrics.apply(batch(sequence: 8, rows: [], turn: "next-turn"))
+    #expect(metrics.reading(agentId: nil).latestWebSearchCallID == nil)
+  }
+
+  @Test func reportsActiveToolKindAndTurnStartTimeAcrossTools() {
+    var metrics = AgentActivityMetrics()
+    metrics.apply(snapshot(sequence: 5, rows: [
+      row("turn", sequence: 1, body: ["kind": "turn", "state": "running", "startedAt": 1_700_000_000_000], scope: nil),
+      row("edit", sequence: 2, body: ["kind": "tool-call", "callId": "e1", "name": "edit_file", "state": "completed"]),
+      row("shell", sequence: 3, body: ["kind": "tool-call", "callId": "c1", "name": "bash", "state": "running",
+        "input": ["command": "swift test"]]),
+      row("browser", sequence: 4, body: ["kind": "tool-call", "callId": "b1", "name": "bash", "state": "running",
+        "input": ["command": "orca browser open https://example.com"]]),
+    ]))
+    let reading1 = metrics.reading(agentId: nil)
+    #expect(reading1.activeToolKind == .browser)
+    #expect(reading1.turnStartedAt == 1_700_000_000_000)
+
+    metrics.apply(batch(sequence: 6, rows: [
+      row("browser-done", sequence: 6, body: ["kind": "message", "blocks": [["type": "tool-result", "callId": "b1"]]]),
+    ]))
+    #expect(metrics.reading(agentId: nil).activeToolKind == .command)
+
+    metrics.apply(batch(sequence: 7, rows: [
+      row("mcp", sequence: 7, body: ["kind": "tool-call", "callId": "m1", "name": "mcp__github__list_prs", "state": "running"]),
+    ]))
+    #expect(metrics.reading(agentId: nil).activeToolKind == .integration)
+
+    metrics.apply(batch(sequence: 8, rows: [
+      row("done-all", sequence: 8, body: ["kind": "message", "blocks": [
+        ["type": "tool-result", "callId": "c1"],
+        ["type": "tool-result", "callId": "m1"],
+      ]]),
+    ]))
+    #expect(metrics.reading(agentId: nil).activeToolKind == nil)
+  }
+
   @Test func usesCumulativeCodexChildTotalsFromTheBackgroundChannel() {
     var metrics = AgentActivityMetrics()
     let background: (Int) -> JSONValue = { total in

@@ -56,6 +56,39 @@ public struct TranscriptItem: Sendable, Equatable, Identifiable {
       outputImagePaths = (json["outputImagePaths"]?.arrayValue ?? []).compactMap(\.stringValue)
     }
 
+    public enum ActivityKind: String, Sendable, Equatable, Hashable {
+      case command, fileChange, webSearch, browser, search, read, integration, subagent, plan, other
+    }
+
+    public static func isWebSearch(name: String) -> Bool {
+      switch name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "webfetch", "web search", "websearch", "web_search", "web-search", "search web", "search_web":
+        return true
+      default:
+        return false
+      }
+    }
+
+    public static func activityKind(name: String, command: String? = nil, hasWebSearchResults: Bool = false) -> ActivityKind {
+      if hasWebSearchResults || isWebSearch(name: name) { return .webSearch }
+      let word = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if word.hasPrefix("mcp__") { return .integration }
+      if ["bash", "shell", "exec", "local_shell", "exec_command", "run_command", "command"].contains(word) {
+        return (command ?? "").contains("orca browser") ? .browser : .command
+      }
+      switch word {
+      case "browser", "orca_browser": return .browser
+      case "read", "read_file", "view", "list", "ls", "list_dir": return .read
+      case "search", "grep", "glob", "find", "find_by_name": return .search
+      case "diff", "edit", "multiedit", "write", "write_file", "edit_file", "notebookedit", "apply_patch",
+        "str_replace_based_edit_tool":
+        return .fileChange
+      case "task", "agent", "subagent", "invoke_subagent": return .subagent
+      case "todowrite", "update_plan": return .plan
+      default: return .other
+      }
+    }
+
     /// The one line a collapsed tool row shows: the command, path, pattern or URL it was called with.
     public var summary: String {
       for key in ["command", "file_path", "path", "pattern", "query", "url", "description", "prompt"] {

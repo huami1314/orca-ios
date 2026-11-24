@@ -308,6 +308,69 @@ import Testing
       == .init(indices: [1, 2], nextIndex: 3, didAdvance: true, scrollsOnlySecondRow: false))
   }
 
+  @Test func splitsAttentionAndWorkingZonesWhenMultipleAttentionExist() {
+    let host = UUID()
+    let agents = ["dec1", "ans1", "w1", "w2", "w3"].map { WorkingAgent.ID(host: host, pane: $0) }
+    var rotation = WorkingAgentRotation()
+    #expect(rotation.page(in: agents, at: 0, rotating: true, splitAt: 2)
+      == .init(indices: [0, 2], nextIndex: 1, secondaryNextIndex: 3, didAdvance: false, splitAt: 2))
+    #expect(rotation.page(in: agents, at: 2.9, rotating: true, splitAt: 2)
+      == .init(indices: [0, 2], nextIndex: 1, secondaryNextIndex: 3, didAdvance: false, splitAt: 2))
+    #expect(rotation.page(in: agents, at: 3.0, rotating: true, splitAt: 2)
+      == .init(indices: [1, 3], nextIndex: 0, secondaryNextIndex: 4, didAdvance: true, splitAt: 2))
+    #expect(rotation.page(in: agents, at: 6.0, rotating: true, splitAt: 2)
+      == .init(indices: [0, 4], nextIndex: 1, secondaryNextIndex: 2, didAdvance: true, splitAt: 2))
+    // A brand-new attention jumps to Row 1 immediately without disturbing Row 2's working anchor.
+    let expanded = [agents[0], WorkingAgent.ID(host: host, pane: "dec2"), agents[1], agents[2], agents[3], agents[4]]
+    #expect(rotation.page(in: expanded, at: 7.0, rotating: true, preferring: expanded[1], splitAt: 3)
+      == .init(indices: [1, 5], nextIndex: 2, secondaryNextIndex: 3, didAdvance: false, splitAt: 3))
+    // When only one working agent remains, Row 1 rotates attention while Row 2 stays steady on that worker.
+    let oneWorker = [agents[0], agents[1], agents[2]]
+    var solo = WorkingAgentRotation()
+    #expect(solo.page(in: oneWorker, at: 0, rotating: true, splitAt: 2)
+      == .init(indices: [0, 2], nextIndex: 1, secondaryNextIndex: nil, didAdvance: false, splitAt: 2))
+    #expect(solo.page(in: oneWorker, at: 3.0, rotating: true, splitAt: 2)
+      == .init(indices: [1, 2], nextIndex: 0, secondaryNextIndex: nil, didAdvance: true, splitAt: 2))
+  }
+
+  @Test func ranksDecisionsAheadOfQuestionsAndWorkingAndCarriesWorktreeMetadata() throws {
+    let workspace = try #require(Worktree([
+      "worktreeId": "wt-42", "repoId": "r", "displayName": "API",
+      "agents": [
+        ["paneKey": "p1", "state": "working", "updatedAt": 1_700_000_005_000],
+      ],
+    ]))
+    let agents = WorkingAgent.inCatalog([workspace], host: UUID())
+    #expect(agents.first?.worktreeId == "wt-42")
+    #expect(agents.first?.updatedAt == 1_700_000_005_000)
+    #expect(WorkingAgent.Activity.needsDecision.priority < WorkingAgent.Activity.needsAnswer.priority)
+    #expect(WorkingAgent.Activity.needsAnswer.priority < WorkingAgent.Activity.working.priority)
+  }
+
+  @Test func stepsForwardAndBackwardManuallyEvenWhileRotationIsPaused() {
+    let host = UUID()
+    let agents = ["a", "b", "c", "d"].map { WorkingAgent.ID(host: host, pane: $0) }
+    var full = WorkingAgentRotation()
+    #expect(full.page(in: agents, at: 0, rotating: false).indices == [0, 1])
+    // Backward wraps 0 -> 3 cleanly while paused.
+    #expect(full.page(in: agents, at: 1, rotating: false, step: -1)
+      == .init(indices: [3, 0], nextIndex: 1, didAdvance: true, stepDirection: -1))
+    // Forward steps 3 -> 0 cleanly while paused.
+    #expect(full.page(in: agents, at: 2, rotating: false, step: 1)
+      == .init(indices: [0, 1], nextIndex: 2, didAdvance: true, stepDirection: 1))
+    // Pin-1 backward steps row 2 while keeping row 1 pinned.
+    var pinned = WorkingAgentRotation()
+    #expect(pinned.page(in: agents, at: 0, rotating: false, pinned: agents[0]).indices == [0, 1])
+    #expect(pinned.page(in: agents, at: 1, rotating: false, pinned: agents[0], step: -1)
+      == .init(indices: [0, 3], nextIndex: 1, didAdvance: true, stepDirection: -1, scrollsOnlySecondRow: true))
+    // Split-zone backward steps both zones cleanly.
+    let splitAgents = ["d1", "a1", "w1", "w2", "w3"].map { WorkingAgent.ID(host: host, pane: $0) }
+    var split = WorkingAgentRotation()
+    #expect(split.page(in: splitAgents, at: 0, rotating: false, splitAt: 2).indices == [0, 2])
+    #expect(split.page(in: splitAgents, at: 1, rotating: false, splitAt: 2, step: -1)
+      == .init(indices: [1, 4], nextIndex: 0, secondaryNextIndex: 2, didAdvance: true, stepDirection: -1, splitAt: 2))
+  }
+
   @Test func detectsCrossHostDuplicateTitlesOnlyAcrossDistinctHosts() {
     let hostA = UUID()
     let hostB = UUID()

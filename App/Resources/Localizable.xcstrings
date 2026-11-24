@@ -91095,19 +91095,19 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Two-line mode"
+            "value": "Mini status bar"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "双行模式"
+            "value": "迷你状态条"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "雙行模式"
+            "value": "迷你狀態列"
           }
         }
       }
@@ -91742,19 +91742,19 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Two-line mode cycles through working agents on your paired desktops. The session's ⋯ menu opens Picture in Picture at any time."
+            "value": "Never lose track of your agents while scrolling TikTok."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "双行模式轮换显示各台已配对主机上正在工作的智能体。可从会话的 ⋯ 菜单手动打开画中画。"
+            "value": "妈妈再也不用担心刷抖音忘记 agent 状态了"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "雙行模式輪換顯示各台已配對主機上正在工作的代理。可從工作階段的 ⋯ 選單手動開啟子母畫面。"
+            "value": "媽媽再也不用擔心刷抖音忘記 agent 狀態了"
           }
         }
       }

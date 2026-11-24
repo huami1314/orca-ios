@@ -789,7 +789,7 @@ final class SessionViewController: UIViewController {
               image: UIImage(systemName: "rectangle.on.rectangle"), state: PiPCenter.startsOnLeave ? .on : .off
             ) { _ in PiPCenter.startsOnLeave.toggle() },
             UIAction(
-              title: String(localized: "orcaios.pip.compact", defaultValue: "Two-line mode"),
+              title: String(localized: "orcaios.pip.compact", defaultValue: "Mini status bar"),
               image: UIImage(systemName: "rectangle.compress.vertical"), state: PiPCenter.usesCompactLayout ? .on : .off
             ) { _ in PiPCenter.usesCompactLayout.toggle() },
             UIAction(

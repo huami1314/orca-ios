@@ -109,7 +109,7 @@
         "restartMessage": "Close Orca from the app switcher and open it again. Until then, Orca keeps its current language."
       },
       "pip": {
-        "compact": "Two-line mode",
+        "compact": "Mini status bar",
         "noWorkingAgents": "No agents working",
         "statusUnavailable": "Agent status unavailable",
         "workingAgents_one": "{{count}} working",
@@ -134,7 +134,7 @@
       "settings": {
         "title": "Orca iOS",
         "pipHeading": "PICTURE IN PICTURE",
-        "pipFooter": "Two-line mode cycles through working agents on your paired desktops. The session's ⋯ menu opens Picture in Picture at any time.",
+        "pipFooter": "Never lose track of your agents while scrolling TikTok.",
         "activityHeading": "LIVE ACTIVITIES",
         "activityFooter": "A working agent shows on the Lock Screen and in the Dynamic Island until it stops.",
         "activityToggle": "Show working agents",
@@ -301,7 +301,7 @@
         "restartMessage": "在多任务界面关闭 Orca 后再打开。在此之前，Orca 仍使用当前语言。"
       },
       "pip": {
-        "compact": "双行模式",
+        "compact": "迷你状态条",
         "noWorkingAgents": "没有智能体在工作",
         "statusUnavailable": "暂时无法获取智能体状态",
         "workingAgents_one": "{{count}} 个工作中",
@@ -326,7 +326,7 @@
       "settings": {
         "title": "Orca iOS",
         "pipHeading": "画中画",
-        "pipFooter": "双行模式轮换显示各台已配对主机上正在工作的智能体。可从会话的 ⋯ 菜单手动打开画中画。",
+        "pipFooter": "妈妈再也不用担心刷抖音忘记 agent 状态了",
         "activityHeading": "实时活动",
         "activityFooter": "智能体工作时显示在锁定屏幕和灵动岛上，停下后消失。",
         "activityToggle": "显示工作中的智能体",
@@ -514,7 +514,7 @@
         "restartMessage": "在 App 切換器中關閉 Orca 後再開啟。在此之前，Orca 仍使用目前的語言。"
       },
       "pip": {
-        "compact": "雙行模式",
+        "compact": "迷你狀態列",
         "noWorkingAgents": "沒有代理在工作",
         "statusUnavailable": "暫時無法取得代理狀態",
         "workingAgents_one": "{{count}} 個工作中",
@@ -539,7 +539,7 @@
       "settings": {
         "title": "Orca iOS",
         "pipHeading": "子母畫面",
-        "pipFooter": "雙行模式輪換顯示各台已配對主機上正在工作的代理。可從工作階段的 ⋯ 選單手動開啟子母畫面。",
+        "pipFooter": "媽媽再也不用擔心刷抖音忘記 agent 狀態了",
         "activityHeading": "即時動態",
         "activityFooter": "代理工作時顯示在鎖定畫面和動態島上，停下後消失。",
         "activityToggle": "顯示工作中的代理",
