@@ -7,6 +7,8 @@ final class TextLabel: UILabel {
   var lineHeight: CGFloat? { didSet { restyle() } }
   var letterSpacing: CGFloat = 0 { didSet { restyle() } }
   private var raw: String?
+  private var configuredTextColor: UIColor = .label
+  private var isApplyingAttributedText = false
   private var cached: (width: CGFloat, lines: Int, text: NSAttributedString, layout: TextLayout)?
 
   override init(frame: CGRect) {
@@ -59,11 +61,7 @@ final class TextLabel: UILabel {
   var styledText: NSAttributedString? {
     didSet {
       raw = styledText?.string
-      cached = nil
-      attributedText = styledText
-      accessibilityLabel = raw
-      invalidateIntrinsicContentSize()
-      setNeedsDisplay()
+      applyAttributedText(styledText)
     }
   }
 
@@ -77,17 +75,27 @@ final class TextLabel: UILabel {
     }
   }
 
-  override var textColor: UIColor! { didSet { if raw != nil { restyle() } } }
-  override var font: UIFont! { didSet { if raw != nil { restyle() } } }
+  override var textColor: UIColor! {
+    didSet {
+      guard !isApplyingAttributedText else { return }
+      configuredTextColor = textColor ?? .label
+      if raw != nil { restyle() }
+    }
+  }
+
+  override var font: UIFont! {
+    didSet { if !isApplyingAttributedText, raw != nil { restyle() } }
+  }
 
   private func restyle() {
     if styledText != nil { return }
     guard let raw, let font else {
-      attributedText = nil
+      applyAttributedText(nil)
       return
     }
+    // UILabel mirrors the first run into textColor. Resolve from the colour supplied by the caller.
     var attributes: [NSAttributedString.Key: Any] = [
-      .font: font, .foregroundColor: textColor.resolvedColor(with: traitCollection),
+      .font: font, .foregroundColor: configuredTextColor.resolvedColor(with: traitCollection),
     ]
     if letterSpacing != 0 { attributes[.kern] = letterSpacing }
     let paragraph = NSMutableParagraphStyle()
@@ -100,7 +108,6 @@ final class TextLabel: UILabel {
       }
     }
     attributes[.paragraphStyle] = paragraph
-    cached = nil
     if let runs {
       let text = NSMutableAttributedString()
       for (piece, color) in runs {
@@ -108,10 +115,17 @@ final class TextLabel: UILabel {
         pieceAttributes[.foregroundColor] = color.resolvedColor(with: traitCollection)
         text.append(NSAttributedString(string: piece, attributes: pieceAttributes))
       }
-      attributedText = text
+      applyAttributedText(text)
     } else {
-      attributedText = NSAttributedString(string: raw, attributes: attributes)
+      applyAttributedText(NSAttributedString(string: raw, attributes: attributes))
     }
+  }
+
+  private func applyAttributedText(_ value: NSAttributedString?) {
+    isApplyingAttributedText = true
+    attributedText = value
+    isApplyingAttributedText = false
+    cached = nil
     accessibilityLabel = raw
     invalidateIntrinsicContentSize()
     setNeedsDisplay()
